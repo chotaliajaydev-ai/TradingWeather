@@ -55,14 +55,23 @@ def build_agent():
     weather_tool = Tool(
         name="GetWeather",
         func=get_weather,
-        description="Get weather information for a city. Input should be a city name.",
+        description="Use this ONLY for weather-related questions: current weather, temperature, conditions, forecast, or climate in a city. Input must be a city name (e.g. London, New York).",
     )
 
     account_tool = Tool(
         name="GetAccountBalance",
         func=get_account_balance,
-        description="Get Alpaca account buying power.",
+        description="Use this ONLY for trading account questions: Alpaca account balance, buying power, account status, or how much you can trade with. Input is ignored; no city or location needed.",
     )
+
+    tool_selection_prefix = """You have access to the following tools. Choose exactly one based on the user's intent:
+
+- WEATHER: If the user asks about weather, temperature, forecast, conditions, or climate in a city or place -> use GetWeather with the city name as input.
+- TRADING ACCOUNT: If the user asks about their Alpaca trading account, balance, buying power, or how much they can trade -> use GetAccountBalance (no input needed).
+
+Do not use GetWeather for account or trading questions. Do not use GetAccountBalance for weather questions. Answer in a brief, helpful way after using the correct tool.
+
+"""
 
     llm = ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-3.5-turbo"), temperature=0.3)
 
@@ -71,6 +80,7 @@ def build_agent():
         llm=llm,
         agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
         verbose=True,
+        agent_kwargs={"prefix": tool_selection_prefix},
     )
     return agent
 
