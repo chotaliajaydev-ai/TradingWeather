@@ -1,13 +1,108 @@
 import os
 import requests
+from datetime import datetime, timedelta, date
 from dotenv import load_dotenv
 import streamlit as st
 from langchain.agents import AgentType, Tool, initialize_agent
 from langchain_openai import ChatOpenAI
 from alpaca.trading.client import TradingClient
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
 
 
 load_dotenv()
+
+
+def get_vwap_tool(symbol: str) -> str:
+    """
+    Calculates today's VWAP (Volume Weighted Average Price) for a stock using
+    intraday minute bars. VWAP = Sum(TypicalPrice * Volume) / Sum(Volume).
+    """
+    symbol = symbol.strip().upper()
+    try:
+        alp_key = os.getenv("AlpKey")
+        alp_secret = os.getenv("AlpSecret")
+        if not alp_key or not alp_secret:
+            return "AlpKey/AlpSecret are not set."
+
+        data_client = StockHistoricalDataClient(alp_key, alp_secret)
+
+        today = date.today()
+        request_params = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame.Minute,
+            start=datetime.combine(today, datetime.min.time()),
+        )
+        bars_df = data_client.get_stock_bars(request_params).df
+
+        if bars_df.empty:
+            return f"No intraday data available for {symbol} today. Market may be closed."
+
+        if hasattr(bars_df.index, "levels"):
+            bars_df = bars_df.xs(symbol, level="symbol")
+
+        bars_df["typical_price"] = (bars_df["high"] + bars_df["low"] + bars_df["close"]) / 3
+        bars_df["pv"] = bars_df["typical_price"] * bars_df["volume"]
+
+        cumulative_volume = bars_df["volume"].sum()
+        if cumulative_volume == 0:
+            return f"Volume for {symbol} is zero; cannot calculate VWAP."
+
+        vwap = bars_df["pv"].sum() / cumulative_volume
+        last_price = bars_df["close"].iloc[-1]
+        relation = "above" if last_price > vwap else "below"
+
+        return (
+            f"VWAP for {symbol}: ${vwap:.2f}\n"
+            f"Last price: ${last_price:.2f} (trading {relation} VWAP)"
+        )
+
+    except Exception as e:
+        return f"Error calculating VWAP for {symbol}: {str(e)}"
+
+
+def get_rsi_tool(symbol: str, window: int = 14) -> str:
+    """
+    Calculates the 14-period RSI for a given stock symbol.
+    Identifies overbought (>70) or oversold (<30) conditions.
+    """
+    symbol = symbol.strip().upper()
+    try:
+        alp_key = os.getenv("AlpKey")
+        alp_secret = os.getenv("AlpSecret")
+        if not alp_key or not alp_secret:
+            return "AlpKey/AlpSecret are not set."
+
+        data_client = StockHistoricalDataClient(alp_key, alp_secret)
+
+        start_date = datetime.now() - timedelta(days=window * 2)
+        request_params = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame.Day,
+            start=start_date,
+        )
+        bars_df = data_client.get_stock_bars(request_params).df
+
+        if bars_df.empty:
+            return f"No data found for {symbol}."
+
+        if hasattr(bars_df.index, "levels"):
+            bars_df = bars_df.xs(symbol, level="symbol")
+
+        close_prices = bars_df["close"]
+        delta = close_prices.diff()
+        gain = delta.where(delta > 0, 0).rolling(window=window).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+
+        latest_rsi = rsi.iloc[-1]
+        signal = "Overbought (>70)" if latest_rsi > 70 else "Oversold (<30)" if latest_rsi < 30 else "Neutral"
+        return f"The current {window}-day RSI for {symbol} is {latest_rsi:.2f} [{signal}]."
+
+    except Exception as e:
+        return f"Error calculating RSI for {symbol}: {str(e)}"
 
 
 def get_weather(city: str) -> str:
@@ -55,28 +150,55 @@ def build_agent():
     weather_tool = Tool(
         name="GetWeather",
         func=get_weather,
-        description="Use this ONLY for weather-related questions: current weather, temperature, conditions, forecast, or climate in a city. Input must be a city name (e.g. London, New York).",
+        description=(
+            "Use this ONLY for weather-related questions: current weather, temperature, "
+            "conditions, forecast, or climate in a city. Input must be a city name (e.g. London, New York)."
+        ),
     )
 
     account_tool = Tool(
         name="GetAccountBalance",
         func=get_account_balance,
-        description="Use this ONLY for trading account questions: Alpaca account balance, buying power, account status, or how much you can trade with. Input is ignored; no city or location needed.",
+        description=(
+            "Use this ONLY for trading account questions: Alpaca account balance, buying power, "
+            "account status, or how much you can trade with. Input is ignored."
+        ),
+    )
+
+    rsi_tool = Tool(
+        name="GetRSI",
+        func=get_rsi_tool,
+        description=(
+            "Use this ONLY when the user asks about RSI, momentum, overbought or oversold signals "
+            "for a specific stock. Input must be a stock ticker symbol (e.g. AAPL, TSLA, MSFT)."
+        ),
+    )
+
+    vwap_tool = Tool(
+        name="GetVWAP",
+        func=get_vwap_tool,
+        description=(
+            "Use this ONLY when the user asks about VWAP (Volume Weighted Average Price), "
+            "intraday price benchmark, or whether a stock is trading above/below VWAP. "
+            "Input must be a stock ticker symbol (e.g. AAPL, TSLA, MSFT)."
+        ),
     )
 
     tool_selection_prefix = """You have access to the following tools. Choose exactly one based on the user's intent:
 
-- WEATHER: If the user asks about weather, temperature, forecast, conditions, or climate in a city or place -> use GetWeather with the city name as input.
-- TRADING ACCOUNT: If the user asks about their Alpaca trading account, balance, buying power, or how much they can trade -> use GetAccountBalance (no input needed).
+- WEATHER: User asks about weather, temperature, forecast, or climate in a city -> use GetWeather with the city name.
+- TRADING ACCOUNT: User asks about Alpaca account balance, buying power, or account status -> use GetAccountBalance (no input needed).
+- RSI: User asks about RSI, momentum, overbought/oversold levels for a stock -> use GetRSI with the ticker symbol.
+- VWAP: User asks about VWAP, intraday price average, or if a stock is above/below VWAP -> use GetVWAP with the ticker symbol.
 
-Do not use GetWeather for account or trading questions. Do not use GetAccountBalance for weather questions. Answer in a brief, helpful way after using the correct tool.
+Do not mix tools. Use the ticker symbol exactly as given (e.g. AAPL, TSLA). Answer briefly and helpfully after using the correct tool.
 
 """
 
     llm = ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-3.5-turbo"), temperature=0.3)
 
     agent = initialize_agent(
-        tools=[weather_tool, account_tool],
+        tools=[weather_tool, account_tool, rsi_tool, vwap_tool],
         llm=llm,
         agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
         verbose=True,
