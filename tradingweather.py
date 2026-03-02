@@ -1,10 +1,15 @@
 import os
+import tempfile
 import requests
 from datetime import datetime, timedelta, date
 from dotenv import load_dotenv
 import streamlit as st
 from langchain.agents import AgentType, Tool, initialize_agent
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_community.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain.chains import RetrievalQA
 from alpaca.trading.client import TradingClient
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
@@ -141,6 +146,40 @@ def get_account_balance(_: str = "") -> str:
         return f"Failed to fetch account balance: {exc}"
 
 
+def process_pdf(uploaded_file) -> tuple[FAISS, int]:
+    """Load a PDF, split into chunks, embed and return a FAISS vector store."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(uploaded_file.read())
+        tmp_path = tmp.name
+
+    loader = PyPDFLoader(tmp_path)
+    pages = loader.load()
+
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+    docs = splitter.split_documents(pages)
+
+    embeddings = OpenAIEmbeddings()
+    vector_store = FAISS.from_documents(docs, embeddings)
+    return vector_store, len(docs)
+
+
+def answer_pdf_question(question: str) -> str:
+    """Answer a question grounded in the uploaded PDF document via RAG."""
+    vector_store = st.session_state.get("pdf_vector_store")
+    if vector_store is None:
+        return (
+            "No PDF has been uploaded yet. "
+            "Please upload a PDF using the sidebar uploader and try again."
+        )
+    llm = ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-3.5-turbo"), temperature=0)
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=llm,
+        chain_type="stuff",
+        retriever=vector_store.as_retriever(search_kwargs={"k": 4}),
+    )
+    return qa_chain.invoke({"query": question})["result"]
+
+
 @st.cache_resource
 def build_agent():
     openai_key = os.getenv("OPENAI_API_KEY")
@@ -184,12 +223,22 @@ def build_agent():
         ),
     )
 
+    pdf_tool = Tool(
+        name="AnswerPDFQuestion",
+        func=answer_pdf_question,
+        description=(
+            "Use this when the user asks any question about the content of the uploaded PDF document. "
+            "Input must be the user's full question as a string."
+        ),
+    )
+
     tool_selection_prefix = """You have access to the following tools. Choose exactly one based on the user's intent:
 
 - WEATHER: User asks about weather, temperature, forecast, or climate in a city -> use GetWeather with the city name.
 - TRADING ACCOUNT: User asks about Alpaca account balance, buying power, or account status -> use GetAccountBalance (no input needed).
 - RSI: User asks about RSI, momentum, overbought/oversold levels for a stock -> use GetRSI with the ticker symbol.
 - VWAP: User asks about VWAP, intraday price average, or if a stock is above/below VWAP -> use GetVWAP with the ticker symbol.
+- PDF DOCUMENT: User asks anything about the contents of the uploaded PDF document -> use AnswerPDFQuestion with the full question.
 
 Do not mix tools. Use the ticker symbol exactly as given (e.g. AAPL, TSLA). Answer briefly and helpfully after using the correct tool.
 
@@ -198,7 +247,7 @@ Do not mix tools. Use the ticker symbol exactly as given (e.g. AAPL, TSLA). Answ
     llm = ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-3.5-turbo"), temperature=0.3)
 
     agent = initialize_agent(
-        tools=[weather_tool, account_tool, rsi_tool, vwap_tool],
+        tools=[weather_tool, account_tool, rsi_tool, vwap_tool, pdf_tool],
         llm=llm,
         agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
         verbose=True,
@@ -207,7 +256,35 @@ Do not mix tools. Use the ticker symbol exactly as given (e.g. AAPL, TSLA). Answ
     return agent
 
 
-st.title("🌤️ Weather and Trading Agent")
+st.title("🌤️ Weather, Trading & PDF Agent")
+
+# --- Sidebar: PDF uploader ---
+with st.sidebar:
+    st.header("PDF Document")
+    uploaded_file = st.file_uploader("Upload a PDF to chat with", type="pdf")
+
+    if uploaded_file:
+        file_id = f"{uploaded_file.name}_{uploaded_file.size}"
+        if st.session_state.get("pdf_file_id") != file_id:
+            with st.spinner("Indexing PDF…"):
+                try:
+                    vector_store, chunk_count = process_pdf(uploaded_file)
+                    st.session_state["pdf_vector_store"] = vector_store
+                    st.session_state["pdf_file_id"] = file_id
+                    st.session_state["pdf_name"] = uploaded_file.name
+                    st.success(f"Indexed **{uploaded_file.name}** ({chunk_count} chunks)")
+                except Exception as exc:
+                    st.error(f"Failed to process PDF: {exc}")
+        else:
+            st.info(f"Active PDF: **{st.session_state.get('pdf_name')}**")
+
+    if st.session_state.get("pdf_vector_store") and st.button("Clear PDF"):
+        del st.session_state["pdf_vector_store"]
+        del st.session_state["pdf_file_id"]
+        del st.session_state["pdf_name"]
+        st.rerun()
+
+# --- Main chat ---
 prompt = st.text_input("Enter your prompt")
 
 if st.button("Get Result"):

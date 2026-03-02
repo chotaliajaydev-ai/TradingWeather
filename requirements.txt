@@ -3,4 +3,7 @@ python-dotenv
 requests
 langchain
 langchain-openai
+langchain-community
 alpaca-py
+pypdf
+faiss-cpu
